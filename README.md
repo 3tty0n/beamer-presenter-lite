@@ -5,15 +5,15 @@ Presenter for beamer PDFs: speaker notes, laser pointer, timer, blackout, `\movi
 ## Install
 
 ```sh
-pipx install .                              # or: uv tool install .
-beamer-presenter-lite --install-desktop     # optional, Linux app menu
+pipx install .                              # or: uv tool install .; command: bpresent
+bpresent --install-desktop                  # optional, Linux app menu
 ```
 
 ## Use
 
 ```sh
-beamer-presenter-lite main.pdf [-d MINUTES] [-l 1|2|3]   # present
-beamer-presenter-lite --edit main.pdf                    # edit notes (Emacs keys)
+bpresent main.pdf [-d MINUTES] [-l 1|2|3]   # present
+bpresent --edit main.pdf                    # edit notes (Emacs keys)
 ```
 
 Notes come from `main.notes.md` next to the PDF, or from the right half of a PDF
