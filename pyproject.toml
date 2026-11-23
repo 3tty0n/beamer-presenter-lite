@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamer-presenter-lite"
+version = "0.1.0"
+description = "Lightweight presenter for beamer PDFs: speaker notes, pointer, timer, blackout, video"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["PyQt6>=6.5", "pypdfium2>=4", "pypdf>=3"]
+
+[project.scripts]
+beamer-presenter-lite = "beamer_presenter_lite:main"
+
+[tool.setuptools]
+py-modules = ["beamer_presenter_lite"]
