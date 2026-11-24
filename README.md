@@ -1,6 +1,6 @@
 # Beamer Presenter Lite
 
-Presenter for beamer PDFs: speaker notes, laser pointer, timer, blackout, `\movie` playback.
+Presenter for beamer PDFs: speaker notes, laser/pointer/pen annotations, slide overview, timer & pace bar, blackout/whiteout, `\movie` playback.
 
 ## Install
 
@@ -13,7 +13,7 @@ bpresent --install-desktop                  # optional, Linux app menu
 
 ```sh
 bpresent main.pdf [-d MINUTES] [-l 1|2|3]   # present
-bpresent --edit main.pdf                    # edit notes (Emacs keys)
+bpresent --edit main.pdf                    # edit notes (Emacs keys + Markdown highlight)
 ```
 
 Notes come from `main.notes.md` next to the PDF, or from the right half of a PDF
@@ -26,8 +26,12 @@ built with `show notes on second screen=right`.
 # B1      first frame after \appendix
 ```
 
-Keys: → / ← pages, L pointer, B blackout, S / R timer, T / + / - remaining time,
-V / [ / ] / Z video, 1 / 2 / 3 layout, F fullscreen, Q quit.
+### Keys
+
+- **Navigation**: `→`/`Space`/`Enter`/`J`/Wheel next, `←`/`Shift+Enter`/`Backspace`/`K` prev, `num`+`Enter` quick jump, `Home`/`End`, `G` slide overview grid, `:` or `Ctrl+G` jump dialog
+- **Pointer & Pen**: `L` cycle mode (laser/pointer/pen/eraser/off), `D`/`E` toggle pen/eraser, right-drag in pen mode to erase, `P` pen color, `U`/`Ctrl+Z` undo, `C`/`Shift+C` clear page/all
+- **Timer & Notes**: `S`/`R` start-pause/reset timer, `T`/`+`/`-` remaining time, `Ctrl++`/`Ctrl+-` notes font size
+- **Display & Video**: `B`/`.` blackout, `W`/`,` whiteout, `X` swap screens, `V`/`[`/`]`/`Z` video, `Alt+1`/`2`/`3` layout (also via footer layout & swap buttons), `F` fullscreen, `?`/`H` shortcuts, `Q` quit
 
 ## Tools
 
@@ -44,3 +48,19 @@ V / [ / ] / Z video, 1 / 2 / 3 layout, F fullscreen, Q quit.
          ("C-c C-x p" . beamer-notes-edit-with-pdf)
          ("C-c C-x j" . beamer-notes-jump)))
 ```
+
+## Phone rehearsal page (`bpl-rehearse`)
+
+Turns the PDF and its Markdown notes into a static page for practising on a phone:
+one page per slide overlay with its note, swipe or buttons to move, and read-aloud
+with the browser's speech voices (Continuous reads on to the next page).
+
+```console
+bpl-rehearse talk.pdf                      # notes: talk.notes.md, output: talk-rehearse/
+bpl-rehearse talk.pdf -o out --lang ja-JP  # Japanese voice
+```
+
+It writes `index.html` and `img/*.jpg`. Open `index.html` in a browser, or put the
+folder on any static host. Notes use the same format and page mapping as the presenter.
+Parentheses in a note, `(...)` or `（…）`, are cues: shown dimmed and not read aloud.
+Needs pandoc.

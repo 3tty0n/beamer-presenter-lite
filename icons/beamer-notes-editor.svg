@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#242428"/>
+      <stop offset="100%" stop-color="#131316"/>
+    </linearGradient>
+    <linearGradient id="slide" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f7f6f2"/>
+      <stop offset="100%" stop-color="#e8e6e0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Base architectural tile -->
+  <rect x="6" y="6" width="116" height="116" rx="24" fill="url(#bg)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="23.25" fill="none" stroke="#383840" stroke-width="1.5"/>
+
+  <!-- Mini Beamer slide (top-left) -->
+  <rect x="20" y="24" width="52" height="38" rx="5" fill="url(#slide)"/>
+  <path d="M25 24 H67 A5 5 0 0 1 72 29 V34 H20 V29 A5 5 0 0 1 25 24 Z" fill="#32343d"/>
+  <path d="M20.75 34 V29 A4.25 4.25 0 0 1 25 24.75 H67 A4.25 4.25 0 0 1 71.25 29 V34" fill="none" stroke="#4b4e5a" stroke-width="1.1"/>
+  <rect x="26" y="28" width="20" height="2.8" rx="1.4" fill="#eeede8"/>
+  <rect x="26" y="40" width="24" height="3" rx="1.5" fill="#7c7c85"/>
+  <rect x="26" y="47" width="32" height="3" rx="1.5" fill="#b0b0b8"/>
+
+  <!-- Notes editor sheet (bottom-right) -->
+  <rect x="44" y="44" width="64" height="60" rx="6" fill="#09090b" opacity="0.48" transform="translate(0 3)"/>
+  <rect x="44" y="44" width="64" height="60" rx="6" fill="#25252b" stroke="#4e4e58" stroke-width="1.5"/>
+
+  <!-- Markdown heading line (# N) with vermilion accent -->
+  <rect x="53" y="55" width="7" height="4.5" rx="1.5" fill="#e0483a"/>
+  <rect x="64" y="55" width="28" height="4.5" rx="2" fill="#f0efeb"/>
+
+  <!-- Note body lines -->
+  <rect x="53" y="67" width="44" height="3.5" rx="1.75" fill="#9898a2"/>
+  <rect x="53" y="76" width="38" height="3.5" rx="1.75" fill="#9898a2"/>
+  <rect x="53" y="85" width="24" height="3.5" rx="1.75" fill="#9898a2"/>
+
+  <!-- Editor text cursor -->
+  <rect x="81" y="82.5" width="2.8" height="9" rx="1.2" fill="#e0483a"/>
+</svg>

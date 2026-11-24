@@ -13,6 +13,7 @@ dependencies = ["PyQt6>=6.5", "pypdfium2>=4", "pypdf>=3"]
 [project.scripts]
 beamer-presenter-lite = "beamer_presenter_lite:main"
 bpresent = "beamer_presenter_lite:main"
+bpl-rehearse = "bpl_rehearse:main"
 
 [tool.setuptools]
-py-modules = ["beamer_presenter_lite"]
+py-modules = ["beamer_presenter_lite", "bpl_rehearse"]
