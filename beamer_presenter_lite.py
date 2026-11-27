@@ -25,16 +25,18 @@ import time
 import pypdfium2 as pdfium
 from pypdf import PdfReader
 
-from PyQt6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, QUrl
-from PyQt6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QImage, QPainter, QPainterPath,
-                         QPen, QPixmap, QPolygonF, QRadialGradient, QSyntaxHighlighter, QTextBlockFormat,
-                         QTextCharFormat, QTextCursor, QTextDocument)
+from PyQt6.QtCore import (QByteArray, QEvent, QFileSystemWatcher, QMimeData, QPoint, QPointF, QRectF, QSettings,
+                          QSize, QSizeF, Qt, QTimer, QUrl)
+from PyQt6.QtGui import (QBrush, QColor, QDrag, QFont, QFontDatabase, QGuiApplication, QIcon, QImage, QPainter,
+                         QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient, QSyntaxHighlighter,
+                         QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
                              QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-                             QSlider, QSplitter, QStyle, QTextBrowser, QVBoxLayout, QWidget)
+                             QSlider, QSplitter, QSplitterHandle, QStyle, QTextBrowser, QVBoxLayout, QWidget)
 
 MODES = ['laser', 'pointer', 'pen', 'eraser', 'off']
+MIN_ZOOM_SPAN = 0.125   # up to 8x magnification
 PEN_COLORS = [
     ('Red', '#d93829'),
     ('Blue', '#2563c9'),
@@ -285,6 +287,31 @@ QLabel#jumpBadge {
     font-family: "JetBrains Mono", "IBM Plex Mono", "DejaVu Sans Mono", monospace;
     font-size: 12px;
     font-weight: 600;
+}
+QLabel#zoomBadge {
+    background: #142030;
+    color: #8cc4ff;
+    border: 1px solid #2c5b8f;
+    border-radius: 4px;
+    padding: 4px 9px;
+    font-family: "JetBrains Mono", "IBM Plex Mono", "DejaVu Sans Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#zoomResetBtn {
+    background: #142030;
+    color: #8cc4ff;
+    border: 1px solid #2c5b8f;
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-family: "JetBrains Mono", "IBM Plex Mono", "DejaVu Sans Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#zoomResetBtn:hover {
+    background: #1c2e45;
+    border-color: #58a6ff;
+    color: #e6f2ff;
 }
 QPushButton {
     background: #1c1c20;
@@ -605,15 +632,38 @@ class Pdf:
         bm = page.render(scale=h / page.get_size()[1], rev_byteorder=True, prefer_bgrx=True)
         return QImage(bytes(bm.buffer), bm.width, bm.height, bm.stride, QImage.Format.Format_RGBX8888).copy()
 
-    def render_half(self, i, half, split, width, height, dpr=1.0):
+    def render_half(self, i, half, split, width, height, dpr=1.0, region=None):
         w, h = max(1, round(width * dpr)), max(1, round(height * dpr))
-        key = (i, half, split, w, h, round(dpr, 2))
+        if region is None:
+            key = (i, half, split, w, h, round(dpr, 2), None)
+        else:
+            rx = max(0.0, min(1.0, region.x()))
+            ry = max(0.0, min(1.0, region.y()))
+            rw = max(1e-4, min(1.0 - rx, region.width()))
+            rh = max(1e-4, min(1.0 - ry, region.height()))
+            key = (i, half, split, w, h, round(dpr, 2),
+                   (round(rx, 4), round(ry, 4), round(rw, 4), round(rh, 4)))
         img = self._cache.get(key)
         if img is not None:
             self._cache.move_to_end(key)
             return img
-        full = self.render(i, QSize(w * (2 if split else 1), h))
-        img = full.copy(half * w, 0, w, h) if split else full
+        if region is None:
+            full = self.render(i, QSize(w * (2 if split else 1), h))
+            img = full.copy(half * w, 0, w, h) if split else full
+        else:
+            page = self.doc[i]
+            pw, ph = page.get_size()
+            half_w = pw / 2.0 if split else pw
+            hx = half_w * half
+            left = max(0.0, hx + rx * half_w)
+            right = max(0.0, pw - (hx + (rx + rw) * half_w))
+            top = max(0.0, ry * ph)
+            bottom = max(0.0, ph - (ry + rh) * ph)
+            scale = h / max(1e-6, rh * ph)
+            bm = page.render(scale=scale, crop=(left, bottom, right, top),
+                             rev_byteorder=True, prefer_bgrx=True)
+            img = QImage(bytes(bm.buffer), bm.width, bm.height, bm.stride,
+                         QImage.Format.Format_RGBX8888).copy()
         img.setDevicePixelRatio(dpr)
         self._cache[key] = img
         while len(self._cache) > self._cache_size:
@@ -739,20 +789,273 @@ def install_desktop(remove=False):
             print('wrote ' + path)
 
 
-def make_pane(title, widget, extra_widgets=()):
+PANE_MIME = 'application/x-bpl-pane-id'
+
+
+def compute_zoom_rect(p0, p1, min_span=MIN_ZOOM_SPAN):
+    """Aspect-preserving normalized zoom rect (square in 0..1 slide coords) enclosing p0..p1."""
+    x0, y0 = p0
+    x1, y1 = p1
+    span = max(abs(x1 - x0), abs(y1 - y0), min_span)
+    if span >= 0.99:
+        return None
+    cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+    zx = max(0.0, min(1.0 - span, cx - span * 0.5))
+    zy = max(0.0, min(1.0 - span, cy - span * 0.5))
+    return QRectF(zx, zy, span, span)
+
+
+def zoom_around(current_rect, center, factor, min_span=MIN_ZOOM_SPAN):
+    """Scale current zoom rect by factor (>1 zooms in, <1 zooms out) keeping center fixed on screen."""
+    vr = current_rect if current_rect is not None else QRectF(0.0, 0.0, 1.0, 1.0)
+    new_span = vr.width() / factor
+    if new_span >= 0.98:
+        return None
+    new_span = max(min_span, new_span)
+    cx, cy = max(0.0, min(1.0, center[0])), max(0.0, min(1.0, center[1]))
+    u = (cx - vr.x()) / vr.width()
+    v = (cy - vr.y()) / vr.height()
+    zx = max(0.0, min(1.0 - new_span, cx - u * new_span))
+    zy = max(0.0, min(1.0 - new_span, cy - v * new_span))
+    return QRectF(zx, zy, new_span, new_span)
+
+
+def pan_zoom_rect(current_rect, dx, dy):
+    """Shift a normalized zoom rect by (dx, dy) in slide coordinates, clamped to 0..1."""
+    if current_rect is None:
+        return None
+    w, h = current_rect.width(), current_rect.height()
+    zx = max(0.0, min(1.0 - w, current_rect.x() + dx))
+    zy = max(0.0, min(1.0 - h, current_rect.y() + dy))
+    return QRectF(zx, zy, w, h)
+
+
+class PresenterSplitterHandle(QSplitterHandle):
+    """Slim darkroom splitter handle with generous hit area, grip indicator, and double-click reset."""
+
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self._hovered = False
+        self._pressed = False
+        self.setMouseTracking(True)
+        self.setToolTip('Drag to resize panes · double-click to reset')
+
+    def enterEvent(self, e):
+        self._hovered = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self.update()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._pressed:
+            self._pressed = False
+            self.update()
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            sp = self.splitter()
+            if sp is not None and getattr(sp, 'on_reset', None):
+                sp.on_reset()
+                e.accept()
+                return
+        super().mouseDoubleClickEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor('#101012'))
+        line_col = QColor('#d9483b' if self._pressed else ('#5a5a66' if self._hovered else '#242428'))
+        grip_col = QColor('#f0786c' if self._pressed else ('#a0a0aa' if self._hovered else '#3f3f48'))
+        if self.orientation() == Qt.Orientation.Horizontal:
+            cx = w / 2.0
+            p.fillRect(QRectF(cx - 0.5, 0, 1.0, h), line_col)
+            gh = min(32.0, max(12.0, h * 0.14))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(grip_col)
+            p.drawRoundedRect(QRectF(cx - 1.5, (h - gh) / 2.0, 3.0, gh), 1.5, 1.5)
+        else:
+            cy = h / 2.0
+            p.fillRect(QRectF(0, cy - 0.5, w, 1.0), line_col)
+            gw = min(32.0, max(12.0, w * 0.14))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(grip_col)
+            p.drawRoundedRect(QRectF((w - gw) / 2.0, cy - 1.5, gw, 3.0), 1.5, 1.5)
+        p.end()
+
+
+class PresenterSplitter(QSplitter):
+    """QSplitter with an easy-to-grab darkroom handle and ratio helpers."""
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, on_reset=None):
+        super().__init__(orientation)
+        self.on_reset = on_reset
+        self.setHandleWidth(6)
+        self.setChildrenCollapsible(False)
+        self.setOpaqueResize(True)
+
+    def createHandle(self):
+        return PresenterSplitterHandle(self.orientation(), self)
+
+    def apply_ratio(self, ratio, total=None):
+        ratio = max(0.15, min(0.85, float(ratio)))
+        if total is None:
+            total = self.width() if self.orientation() == Qt.Orientation.Horizontal else self.height()
+        if total <= 20:
+            total = 1000
+        a = max(1, round(total * ratio))
+        b = max(1, total - a)
+        self.setSizes([a, b])
+
+    def current_ratio(self):
+        sz = self.sizes()
+        if len(sz) >= 2 and (sz[0] + sz[1]) > 0:
+            return max(0.15, min(0.85, sz[0] / (sz[0] + sz[1])))
+        return None
+
+
+class _DropOverlay(QWidget):
+    """Translucent target border drawn over a pane during drag-and-drop swap."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.hide()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(88, 166, 255, 28))
+        pen = QPen(QColor('#58a6ff'), 2.0)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(self.rect().adjusted(1, 1, -2, -2))
+        p.end()
+
+
+class PaneHeader(QFrame):
+    """Pane header bar that optionally starts a drag-and-drop swap when dragged."""
+
+    def __init__(self, pane_id=None):
+        super().__init__()
+        self.pane_id = pane_id
+        self._drag_start = None
+        self.setObjectName('paneHeader')
+        self.setFixedHeight(32)
+        if pane_id:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.setToolTip('Drag header onto another pane to swap positions')
+
+    def _over_button(self, pos):
+        w = self.childAt(pos)
+        while w is not None and w is not self:
+            if isinstance(w, QPushButton):
+                return True
+            w = w.parentWidget()
+        return False
+
+    def mousePressEvent(self, e):
+        if self.pane_id and e.button() == Qt.MouseButton.LeftButton and not self._over_button(e.position().toPoint()):
+            self._drag_start = e.position().toPoint()
+        else:
+            self._drag_start = None
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (self.pane_id and self._drag_start is not None and
+                bool(e.buttons() & Qt.MouseButton.LeftButton) and
+                (e.position().toPoint() - self._drag_start).manhattanLength() >= QApplication.startDragDistance()):
+            self._drag_start = None
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(PANE_MIME, self.pane_id.encode('utf-8'))
+            drag.setMimeData(mime)
+            pix = self.grab()
+            if not pix.isNull():
+                drag.setPixmap(pix)
+                drag.setHotSpot(QPoint(min(pix.width() // 2, 60), pix.height() // 2))
+            drag.exec(Qt.DropAction.MoveAction)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_start = None
+        super().mouseReleaseEvent(e)
+
+
+class PaneFrame(QFrame):
+    """Architectural flat pane that supports drag-and-drop position swapping when pane_id is set."""
+
+    def __init__(self, pane_id=None, on_drop=None):
+        super().__init__()
+        self.pane_id = pane_id
+        self._on_drop = on_drop
+        self.setObjectName('pane')
+        self._drop_overlay = _DropOverlay(self)
+        if pane_id and on_drop:
+            self.setAcceptDrops(True)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._drop_overlay.setGeometry(self.rect())
+
+    def _incoming_id(self, e):
+        md = e.mimeData()
+        if md and md.hasFormat(PANE_MIME):
+            src = bytes(md.data(PANE_MIME)).decode('utf-8', errors='ignore')
+            if src and src != self.pane_id:
+                return src
+        return None
+
+    def dragEnterEvent(self, e):
+        if self._on_drop and self._incoming_id(e):
+            self._drop_overlay.setGeometry(self.rect())
+            self._drop_overlay.show()
+            self._drop_overlay.raise_()
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._drop_overlay.hide()
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        self._drop_overlay.hide()
+        src = self._incoming_id(e)
+        if self._on_drop and src:
+            e.acceptProposedAction()
+            self._on_drop(src, self.pane_id)
+        else:
+            e.ignore()
+
+
+def make_pane(title, widget, extra_widgets=(), pane_id=None, on_drop=None):
     """Architectural flat pane with a slim hairline header bar."""
-    pane = QFrame()
-    pane.setObjectName('pane')
+    pane = PaneFrame(pane_id=pane_id, on_drop=on_drop)
     lay = QVBoxLayout(pane)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(0)
 
-    hdr = QFrame()
-    hdr.setObjectName('paneHeader')
-    hdr.setFixedHeight(32)
+    hdr = PaneHeader(pane_id=pane_id)
     hl = QHBoxLayout(hdr)
-    hl.setContentsMargins(12, 0, 8, 0)
-    hl.setSpacing(8)
+    hl.setContentsMargins(10 if pane_id else 12, 0, 8, 0)
+    hl.setSpacing(6 if pane_id else 8)
+    if pane_id:
+        grip = QLabel('⋮⋮')
+        grip.setStyleSheet('background: transparent; color: #52525c; font-size: 11px; padding-right: 1px;')
+        hl.addWidget(grip)
     lbl = QLabel(title)
     lbl.setObjectName('paneTitle')
     meta = QLabel('')
@@ -761,10 +1064,13 @@ def make_pane(title, widget, extra_widgets=()):
     hl.addWidget(meta)
     hl.addStretch(1)
     for w in extra_widgets:
+        if isinstance(w, QPushButton):
+            w.setCursor(Qt.CursorShape.ArrowCursor)
         hl.addWidget(w)
 
     lay.addWidget(hdr)
     lay.addWidget(widget, 1)
+    pane._header = hdr
     pane._title_label = lbl
     pane._meta_label = meta
     return pane
@@ -809,9 +1115,9 @@ class ProgressBar(QWidget):
 
 
 class SlideView(QWidget):
-    """Draws one half (0 = slide, 1 = notes) of a PDF page, fitted and centered."""
+    """Draws one half (0 = slide, 1 = notes) of a PDF page, fitted and centered, with optional region zoom."""
 
-    def __init__(self, doc, split, half=0, bg='#0b0b0c'):
+    def __init__(self, doc, split, half=0, bg='#0b0b0c', show_minimap=False):
         super().__init__()
         self.doc, self.split, self.half, self.page = doc, split, half, 0
         self.pointer, self.mode = None, 'laser'   # pointer: (rx, ry) in 0..1 or None
@@ -820,8 +1126,39 @@ class SlideView(QWidget):
         self.frame = None                          # (QRectF 0..1, QImage) video frame overlay
         self.full = False                          # video frame fills the whole widget
         self.annotations = None                    # shared dict {page: [(color, [(rx, ry), ...])]}
+        self.zoom_rect = None                      # QRectF in 0..1 slide coords (w == h), or None
+        self.select_rect = None                    # (p0, p1) in 0..1 slide coords while dragging zoom selection
+        self.show_minimap = show_minimap
+        self._last_render = None                   # (page, half, zoom_key, QImage)
+        self._last_full = None                     # (page, half, QImage)
+        self._fast_draw = False
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.timeout.connect(self._finish_fast_draw)
         self.setStyleSheet(f'background:{bg}')
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+
+    def _finish_fast_draw(self):
+        self._fast_draw = False
+        self.update()
+
+    def schedule_fast_draw(self, delay_ms=80):
+        """Use cached bitmap scaling during interactive resize/pan/wheel, then render crisp PDF."""
+        self._fast_draw = True
+        self._settle_timer.start(delay_ms)
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._last_render is not None and e.oldSize().isValid() and e.oldSize() != e.size():
+            self._fast_draw = True
+            self._settle_timer.start(80)
+
+    def view_rect(self):
+        return self.zoom_rect if self.zoom_rect is not None else QRectF(0.0, 0.0, 1.0, 1.0)
+
+    def zoom_factor(self):
+        return (1.0 / self.zoom_rect.width()) if self.zoom_rect is not None else 1.0
 
     def target(self):
         """Rect where the slide image is drawn, or None if nothing to draw."""
@@ -837,8 +1174,71 @@ class SlideView(QWidget):
         w, h = pw * s, ph * s
         return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
 
+    def slide_to_widget(self, sx, sy, r=None):
+        r = r if r is not None else self.target()
+        vr = self.view_rect()
+        u = (sx - vr.x()) / vr.width()
+        v = (sy - vr.y()) / vr.height()
+        return QPointF(r.x() + u * r.width(), r.y() + v * r.height())
+
+    def widget_to_slide(self, pos, clamp=False):
+        r = self.target()
+        if r is None or r.width() <= 0 or r.height() <= 0:
+            return None
+        u = (pos.x() - r.x()) / r.width()
+        v = (pos.y() - r.y()) / r.height()
+        if not clamp and not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            return None
+        u = max(0.0, min(1.0, u))
+        v = max(0.0, min(1.0, v))
+        vr = self.view_rect()
+        return (vr.x() + u * vr.width(), vr.y() + v * vr.height())
+
+    def minimap_rect(self, r=None):
+        if not self.show_minimap or self.zoom_rect is None:
+            return None
+        r = r if r is not None else self.target()
+        if r is None or r.width() < 260 or r.height() < 160:
+            return None
+        mw = max(96.0, min(180.0, r.width() * 0.22))
+        mh = mw * (r.height() / max(1.0, r.width()))
+        return QRectF(r.right() - mw - 10.0, r.bottom() - mh - 10.0, mw, mh)
+
+    def minimap_to_slide(self, pos, clamp=False):
+        mr = self.minimap_rect()
+        if mr is None:
+            return None
+        if not clamp and not mr.contains(pos):
+            return None
+        sx = max(0.0, min(1.0, (pos.x() - mr.x()) / mr.width()))
+        sy = max(0.0, min(1.0, (pos.y() - mr.y()) / mr.height()))
+        return (sx, sy)
+
     def image(self, r):
-        return self.doc.render_half(self.page, self.half, self.split, r.width(), r.height(), self.devicePixelRatioF())
+        return self.doc.render_half(self.page, self.half, self.split, r.width(), r.height(),
+                                    self.devicePixelRatioF(), region=self.zoom_rect)
+
+    def _draw_slide_image(self, p, r, vr):
+        zkey = None if self.zoom_rect is None else (
+            round(vr.x(), 4), round(vr.y(), 4), round(vr.width(), 4), round(vr.height(), 4)
+        )
+        if self._fast_draw:
+            if self._last_render and self._last_render[:3] == (self.page, self.half, zkey):
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawImage(r, self._last_render[3])
+                return
+            if self._last_full and self._last_full[:2] == (self.page, self.half):
+                fimg = self._last_full[2]
+                src = QRectF(vr.x() * fimg.width(), vr.y() * fimg.height(),
+                             vr.width() * fimg.width(), vr.height() * fimg.height())
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawImage(r, fimg, src)
+                return
+        img = self.image(r)
+        self._last_render = (self.page, self.half, zkey, img)
+        if self.zoom_rect is None:
+            self._last_full = (self.page, self.half, img)
+        p.drawImage(r, img)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -855,24 +1255,38 @@ class SlideView(QWidget):
         if r is None:
             p.end()
             return
+        vr = self.view_rect()
         has_frame = self.frame is not None and not self.frame[1].isNull()
-        if not (has_frame and self.full):
-            p.fillRect(r, Qt.GlobalColor.white)   # PDF pages may render transparent
-            p.drawImage(r.topLeft(), self.image(r))
-        if has_frame:
-            fr, img = self.frame
-            box = QRectF(self.rect()) if self.full else \
-                QRectF(r.x() + fr.x() * r.width(), r.y() + fr.y() * r.height(),
-                       fr.width() * r.width(), fr.height() * r.height())
+        if has_frame and self.full:
+            _, img = self.frame
+            box = QRectF(self.rect())
             sz = img.size().toSizeF().scaled(box.size(), Qt.AspectRatioMode.KeepAspectRatio)
             p.fillRect(box, Qt.GlobalColor.black)
             p.drawImage(QRectF(box.center().x() - sz.width() / 2, box.center().y() - sz.height() / 2,
                                sz.width(), sz.height()), img)
+            p.end()
+            return
+
+        p.save()
+        p.setClipRect(r)
+        p.fillRect(r, Qt.GlobalColor.white)   # PDF pages may render transparent
+        self._draw_slide_image(p, r, vr)
+
+        if has_frame:
+            fr, img = self.frame
+            tl = self.slide_to_widget(fr.x(), fr.y(), r)
+            br = self.slide_to_widget(fr.right(), fr.bottom(), r)
+            box = QRectF(tl, br)
+            sz = img.size().toSizeF().scaled(box.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            p.fillRect(box, Qt.GlobalColor.black)
+            p.drawImage(QRectF(box.center().x() - sz.width() / 2, box.center().y() - sz.height() / 2,
+                               sz.width(), sz.height()), img)
+
         # Hand-drawn annotations for the current slide
-        if self.annotations and not (has_frame and self.full):
+        if self.annotations:
             strokes = self.annotations.get(self.page)
             if strokes:
-                pen_w = max(2.0, r.width() / 240.0)
+                pen_w = max(2.0, (r.width() / vr.width()) / 240.0)
                 for color_hex, pts in strokes:
                     if not pts:
                         continue
@@ -881,16 +1295,17 @@ class SlideView(QWidget):
                     p.setPen(pen)
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     if len(pts) == 1:
-                        x, y = r.x() + pts[0][0] * r.width(), r.y() + pts[0][1] * r.height()
-                        p.drawPoint(QPointF(x, y))
+                        p.drawPoint(self.slide_to_widget(pts[0][0], pts[0][1], r))
                     else:
                         path = QPainterPath()
-                        path.moveTo(r.x() + pts[0][0] * r.width(), r.y() + pts[0][1] * r.height())
+                        path.moveTo(self.slide_to_widget(pts[0][0], pts[0][1], r))
                         for rx, ry in pts[1:]:
-                            path.lineTo(r.x() + rx * r.width(), r.y() + ry * r.height())
+                            path.lineTo(self.slide_to_widget(rx, ry, r))
                         p.drawPath(path)
-        if self.pointer and self.mode != 'off':
-            x, y = r.x() + self.pointer[0] * r.width(), r.y() + self.pointer[1] * r.height()
+
+        if self.pointer and self.mode not in ('off', 'zoom'):
+            pt_w = self.slide_to_widget(self.pointer[0], self.pointer[1], r)
+            x, y = pt_w.x(), pt_w.y()
             if self.mode == 'laser':
                 rad = max(8.0, r.width() / 120)
                 g = QRadialGradient(QPointF(x, y), rad * 2)
@@ -916,6 +1331,68 @@ class SlideView(QWidget):
                 p.setPen(QColor('black'))
                 p.setBrush(QColor('#ffd400'))
                 p.drawPolygon(QPolygonF([QPointF(x + a * k, y + b * k) for a, b in pts]))
+
+        # Interactive zoom region selection preview (presenter view only)
+        if self.select_rect is not None:
+            p0, p1 = self.select_rect
+            eff = compute_zoom_rect(p0, p1)
+            raw_tl = self.slide_to_widget(min(p0[0], p1[0]), min(p0[1], p1[1]), r)
+            raw_br = self.slide_to_widget(max(p0[0], p1[0]), max(p0[1], p1[1]), r)
+            raw_w = QRectF(raw_tl, raw_br)
+            if eff is not None:
+                eff_tl = self.slide_to_widget(eff.x(), eff.y(), r)
+                eff_br = self.slide_to_widget(eff.right(), eff.bottom(), r)
+                eff_w = QRectF(eff_tl, eff_br)
+                mask = QPainterPath()
+                mask.setFillRule(Qt.FillRule.OddEvenFill)
+                mask.addRect(r)
+                mask.addRect(eff_w)
+                p.fillPath(mask, QColor(0, 0, 0, 115))
+                p.setPen(QPen(QColor(255, 255, 255, 110), 1.0, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(raw_w)
+                p.setPen(QPen(QColor('#58a6ff'), 2.0))
+                p.drawRect(eff_w)
+                label = f'{1.0 / eff.width():.1f}×'
+                badge = QRectF(eff_w.x() + 6, max(r.y() + 6, eff_w.y() + 6), 44, 20)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(16, 24, 38, 220))
+                p.drawRoundedRect(badge, 4, 4)
+                p.setPen(QColor('#8cc4ff'))
+                f = p.font()
+                f.setPixelSize(11)
+                f.setWeight(QFont.Weight.DemiBold)
+                p.setFont(f)
+                p.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+
+        # Picture-in-picture zoom navigator minimap (presenter view only)
+        mr = self.minimap_rect(r)
+        if mr is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 160))
+            p.drawRoundedRect(mr.adjusted(-3, -3, 3, 3), 4, 4)
+            if self._last_full and self._last_full[:2] == (self.page, self.half):
+                thumb = self._last_full[2]
+            else:
+                thumb = self.doc.render_half(self.page, self.half, self.split, mr.width(), mr.height(),
+                                             self.devicePixelRatioF(), region=None)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.fillRect(mr, Qt.GlobalColor.white)
+            p.drawImage(mr, thumb)
+            box = QRectF(mr.x() + vr.x() * mr.width(), mr.y() + vr.y() * mr.height(),
+                         vr.width() * mr.width(), vr.height() * mr.height())
+            dim = QPainterPath()
+            dim.setFillRule(Qt.FillRule.OddEvenFill)
+            dim.addRect(mr)
+            dim.addRect(box)
+            p.fillPath(dim, QColor(0, 0, 0, 120))
+            p.setPen(QPen(QColor('#58a6ff'), 1.8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(box)
+            p.setPen(QPen(QColor('#464652'), 1.0))
+            p.drawRect(mr)
+
+        p.restore()
         p.end()
 
 
@@ -942,13 +1419,13 @@ class HelpOverlay(QFrame):
             ('G', 'Slide overview'),
             (': / Ctrl+G', 'Jump dialog (frame or pN)'),
         ]),
-        ('Pointer & Pen', [
-            ('L', 'Cycle mode (laser / pointer / pen / eraser / off)'),
-            ('D / E', 'Toggle pen / eraser'),
-            ('Right-drag (pen)', 'Quick erase'),
-            ('P', 'Cycle pen color'),
-            ('U / Ctrl+Z', 'Undo last stroke'),
-            ('C / Shift+C', 'Clear page / all drawings'),
+        ('Pointer, Pen & Zoom', [
+            ('L', 'Cycle laser / pointer / pen / eraser / off'),
+            ('D / E', 'Toggle pen / eraser (right-drag erase)'),
+            ('P / U / C', 'Pen color / undo / clear (Shift+C all)'),
+            ('M / Shift+M', 'Zoom region (toggle / re-select) · click 2×'),
+            ('Ctrl+Drag / Wheel', 'Quick region zoom / zoom in-out'),
+            ('Shift+Drag / Esc', 'Pan zoomed view / reset zoom (Ctrl+0)'),
         ]),
         ('Timer & Notes', [
             ('S / R', 'Start-pause / reset timer'),
@@ -956,11 +1433,11 @@ class HelpOverlay(QFrame):
             ('+ / -', 'Adjust remaining ±1 min'),
             ('Ctrl++ / Ctrl+-', 'Notes font size'),
         ]),
-        ('Display & Video', [
-            ('B / .', 'Blackout audience'),
-            ('W / ,', 'Whiteout audience'),
+        ('Display & Layout', [
+            ('B / .   W / ,', 'Blackout / whiteout audience'),
             ('X', 'Swap screens'),
-            ('Alt+1 / 2 / 3 (or footer)', 'Switch / swap slide & notes layout'),
+            ('Alt+1 / 2 / 3', 'Switch presenter layout (or footer)'),
+            ('Drag borders / hdr', 'Resize (dbl-click reset) / swap panes'),
             ('V / [ ] / Z', 'Video play, ±5s, fullscreen'),
             ('F / ? / Q', 'Fullscreen, help, quit'),
         ]),
@@ -975,7 +1452,7 @@ class HelpOverlay(QFrame):
 
         box = QFrame()
         box.setObjectName('helpBox')
-        box.setMaximumWidth(860)
+        box.setMaximumWidth(980)
         bl = QVBoxLayout(box)
         bl.setContentsMargins(28, 22, 28, 24)
         bl.setSpacing(18)
@@ -1175,8 +1652,21 @@ class OverviewOverlay(QFrame):
             super().keyPressEvent(e)
 
 
+DEFAULT_SPLIT_RATIOS = {
+    1: {'main': 11.0 / 20.0, 'side': 2.0 / 7.0},
+    2: {'main': 4.0 / 9.0, 'top': 0.5},
+    3: {'main': 0.5},
+}
+
+DEFAULT_PANE_ORDER = {
+    1: ['cur', 'next', 'notes'],
+    2: ['cur', 'next', 'notes'],
+    3: ['cur', 'next'],
+}
+
+
 class Presenter(QWidget):
-    def __init__(self, path, minutes, layout=1, notes=None):
+    def __init__(self, path, minutes, layout=1, notes=None, save_prefs=True, reset_layout=False):
         super().__init__()
         try:
             self.doc = Pdf(path)
@@ -1194,12 +1684,25 @@ class Presenter(QWidget):
         self.undo_stack = []                       # [('add', page, stroke) | ('erase', page, idx, stroke) | ('clear', snapshot)]
         self.drawing_stroke = None
         self.erasing = False
+        self.zoom_rect = None
+        self._pre_zoom_mode = 'laser'
+        self._zoom_drag_start = None
+        self._zoom_drag_start_px = None
+        self._panning = False
+        self._pan_last_px = None
+        self._pan_minimap = False
         self.note_font_px = 20
         self.jump_buf = ''
         self.layout_swapped = False
+        self._save_prefs = save_prefs
+        self.split_ratios = {k: dict(v) for k, v in DEFAULT_SPLIT_RATIOS.items()}
+        self.pane_order = {k: list(v) for k, v in DEFAULT_PANE_ORDER.items()}
+        self._active_splitters = {}
+        if self._save_prefs and not reset_layout:
+            self._load_layout_prefs()
 
         self.setWindowTitle(f'Presenter — {os.path.basename(path)}')
-        self.cur = SlideView(self.doc, self.split)
+        self.cur = SlideView(self.doc, self.split, show_minimap=True)
         self.cur.annotations = self.annotations
         self.cur.setMouseTracking(True)
         self.cur.setCursor(Qt.CursorShape.CrossCursor)
@@ -1210,7 +1713,7 @@ class Presenter(QWidget):
         self.cur.wheelEvent = self.on_wheel
 
         self.next = SlideView(self.doc, self.split)
-        self.next.wheelEvent = self.on_wheel
+        self.next.wheelEvent = self.on_next_wheel
 
         auto = os.path.splitext(path)[0] + '.notes.md'
         self.notes_path = notes or (auto if os.path.exists(auto) else None)
@@ -1246,15 +1749,32 @@ class Presenter(QWidget):
         self.btn_undo.setToolTip('Undo stroke (U / Ctrl+Z)')
         self.btn_clear = QPushButton('Clear')
         self.btn_clear.setToolTip('Clear page drawings (C / Shift+C all)')
+        self.btn_zoom = QPushButton('Zoom')
+        self.btn_zoom.setToolTip('Zoom slide region (M, or Ctrl+drag / Ctrl+wheel)')
+        self.btn_zoom_reset = QPushButton('1×')
+        self.btn_zoom_reset.setObjectName('zoomResetBtn')
+        self.btn_zoom_reset.setToolTip('Reset slide zoom (M / Esc / Ctrl+0)')
+        self.btn_zoom_reset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_zoom_reset.clicked.connect(self.reset_zoom)
+        self.btn_zoom_reset.hide()
         for b, cb in ((self.btn_pen, self.toggle_pen), (self.btn_eraser, self.toggle_eraser),
-                      (self.btn_undo, self.undo_stroke), (self.btn_clear, lambda: self.clear_strokes(False))):
+                      (self.btn_undo, self.undo_stroke), (self.btn_clear, lambda: self.clear_strokes(False)),
+                      (self.btn_zoom, lambda: self.toggle_zoom_mode(force_select=True))):
             b.setObjectName('toolBtn')
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(cb)
-        self.cur_card = make_pane('Current', self.cur,
-                                  [self.btn_pen, self.btn_color, self.btn_eraser, self.btn_undo, self.btn_clear])
-        self.next_card = make_pane('Next', self.next)
-        self.notes_card = make_pane('Notes', self.notes, note_btns)
+        self.cur_card = make_pane(
+            'Current', self.cur,
+            [self.btn_zoom, self.btn_zoom_reset, self.btn_pen, self.btn_color,
+             self.btn_eraser, self.btn_undo, self.btn_clear],
+            pane_id='cur', on_drop=self.swap_panes_by_id,
+        )
+        self.next_card = make_pane('Next', self.next, pane_id='next', on_drop=self.swap_panes_by_id)
+        self.notes_card = make_pane('Notes', self.notes, note_btns, pane_id='notes', on_drop=self.swap_panes_by_id)
+        self.cur_card.setMinimumSize(200, 120)
+        self.next_card.setMinimumSize(140, 100)
+        self.notes_card.setMinimumSize(140, 100)
+        self._panes = {'cur': self.cur_card, 'next': self.next_card, 'notes': self.notes_card}
 
         # Structured telemetry & timer strip
         def make_stat(label_text, val_obj='statValue'):
@@ -1296,6 +1816,9 @@ class Presenter(QWidget):
         self.lbl_jump = QLabel()
         self.lbl_jump.setObjectName('jumpBadge')
         self.lbl_jump.hide()
+        self.lbl_zoom = QLabel()
+        self.lbl_zoom.setObjectName('zoomBadge')
+        self.lbl_zoom.hide()
         self.lbl_blank = QLabel()
         self.lbl_blank.hide()
         self.lbl_mode = QLabel()
@@ -1311,6 +1834,7 @@ class Presenter(QWidget):
         tel_row.addWidget(clk_w)
         tel_row.addStretch(1)
         tel_row.addWidget(self.lbl_jump, 0, Qt.AlignmentFlag.AlignVCenter)
+        tel_row.addWidget(self.lbl_zoom, 0, Qt.AlignmentFlag.AlignVCenter)
         tel_row.addWidget(self.lbl_blank, 0, Qt.AlignmentFlag.AlignVCenter)
         tel_row.addWidget(self.lbl_mode, 0, Qt.AlignmentFlag.AlignVCenter)
         s_lay.addLayout(tel_row)
@@ -1322,7 +1846,7 @@ class Presenter(QWidget):
         footer = QHBoxLayout(footer_bar)
         footer.setContentsMargins(12, 0, 8, 0)
         footer.setSpacing(6)
-        self.help_bar = QLabel('←/→ Slides   Shift+↵ Back   N+↵ Jump   G Overview   S Timer   B/W Blank   X Swap   Alt+1–3 Layout')
+        self.help_bar = QLabel('←/→ Slides   N+↵ Jump   M Zoom   G Overview   S Timer   B/W Blank   Drag borders/headers')
         self.help_bar.setStyleSheet('background: transparent; color: #5e5e65; font-size: 11px;')
 
         self.layout_btns = {}
@@ -1347,6 +1871,13 @@ class Presenter(QWidget):
         self.btn_swap_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_swap_layout.clicked.connect(self.toggle_layout_swap)
 
+        self.btn_reset_layout = QPushButton('Reset')
+        self.btn_reset_layout.setObjectName('toolBtn')
+        self.btn_reset_layout.setToolTip('Reset pane sizes and order to default')
+        self.btn_reset_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_reset_layout.clicked.connect(self.reset_current_layout)
+        self.btn_reset_layout.hide()
+
         f_sep = QFrame()
         f_sep.setObjectName('vSep')
         f_sep.setFixedHeight(14)
@@ -1366,6 +1897,7 @@ class Presenter(QWidget):
         for lid in (1, 2, 3):
             footer.addWidget(self.layout_btns[lid])
         footer.addWidget(self.btn_swap_layout)
+        footer.addWidget(self.btn_reset_layout)
         footer.addWidget(f_sep)
         footer.addWidget(btn_grid)
         footer.addWidget(btn_help)
@@ -1377,7 +1909,10 @@ class Presenter(QWidget):
         main.setSpacing(0)
         main.addWidget(self.body, 1)
         main.addWidget(footer_bar)
+        self.resize(1440, 880)
         self.set_layout(layout)
+        if reset_layout and self._save_prefs:
+            self._save_layout_prefs()
 
         self.movies = find_movies(path, self.split)
         self.player, self.movie = QMediaPlayer(self), None   # movie: (rect, path) currently loaded
@@ -1430,7 +1965,6 @@ class Presenter(QWidget):
         else:
             self.aud.resize(1280, 720)
             self.aud.show()
-        self.resize(1440, 880)
         self.show()
 
         t = QTimer(self, interval=250)
@@ -1452,6 +1986,11 @@ class Presenter(QWidget):
             self.stop_video()
             self.drawing_stroke = None
             self.erasing = False
+            self._cancel_zoom_interaction()
+            if self.zoom_rect is not None:
+                self.set_zoom(None, fast=False)
+            if self.mode == 'zoom':
+                self.mode = self._pre_zoom_mode
             if self.movies.get(n):                  # preload so the seek bar knows the duration
                 self.load_video(self.movies[n][0])
         self.n = n
@@ -1517,6 +2056,18 @@ class Presenter(QWidget):
 
     def on_wheel(self, e):
         dy = e.angleDelta().y()
+        if dy == 0:
+            return
+        if bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier) or self.mode == 'zoom':
+            pt = self.cur.widget_to_slide(e.position(), clamp=True)
+            if pt is not None:
+                factor = 1.25 if dy > 0 else (1.0 / 1.25)
+                self.set_zoom(zoom_around(self.zoom_rect, pt, factor), fast=True)
+            return
+        self.go(self.n + (1 if dy < 0 else -1))
+
+    def on_next_wheel(self, e):
+        dy = e.angleDelta().y()
         if dy != 0:
             self.go(self.n + (1 if dy < 0 else -1))
 
@@ -1550,6 +2101,52 @@ class Presenter(QWidget):
         self.show_notes()
 
     # --- presenter layout ---
+    def _settings(self):
+        return QSettings('beamer-presenter-lite', 'BeamerPresenterLite')
+
+    def _load_layout_prefs(self):
+        s = self._settings()
+        sw = s.value('layout/swapped', None)
+        if sw is not None:
+            self.layout_swapped = str(sw).lower() in ('true', '1', 'yes')
+        for lid, defaults in DEFAULT_SPLIT_RATIOS.items():
+            for key in defaults:
+                raw = s.value(f'layout/{lid}/ratio_{key}', None)
+                if raw is not None:
+                    try:
+                        val = float(raw)
+                        if 0.15 <= val <= 0.85:
+                            self.split_ratios[lid][key] = val
+                    except (TypeError, ValueError):
+                        pass
+        for lid, default_order in DEFAULT_PANE_ORDER.items():
+            raw = s.value(f'layout/{lid}/order', None)
+            if raw:
+                items = [x.strip() for x in str(raw).split(',') if x.strip()]
+                if sorted(items) == sorted(default_order):
+                    self.pane_order[lid] = items
+
+    def _save_layout_prefs(self):
+        if not self._save_prefs:
+            return
+        s = self._settings()
+        s.setValue('layout/swapped', self.layout_swapped)
+        for lid, ratios in self.split_ratios.items():
+            for key, val in ratios.items():
+                s.setValue(f'layout/{lid}/ratio_{key}', round(float(val), 4))
+        for lid, order in self.pane_order.items():
+            s.setValue(f'layout/{lid}/order', ','.join(order))
+
+    def _is_layout_customized(self, n):
+        if self.layout_swapped:
+            return True
+        if self.pane_order[n] != DEFAULT_PANE_ORDER[n]:
+            return True
+        for k, dv in DEFAULT_SPLIT_RATIOS[n].items():
+            if abs(self.split_ratios[n][k] - dv) > 0.015:
+                return True
+        return False
+
     def _refresh_layout_buttons(self):
         for lid, btn in self.layout_btns.items():
             name = 'toolBtnActive' if lid == self.layout_no else 'toolBtn'
@@ -1562,51 +2159,148 @@ class Presenter(QWidget):
             self.btn_swap_layout.setObjectName(sname)
             self.btn_swap_layout.style().unpolish(self.btn_swap_layout)
             self.btn_swap_layout.style().polish(self.btn_swap_layout)
+        self.btn_reset_layout.setVisible(self._is_layout_customized(self.layout_no))
 
     def toggle_layout_swap(self):
         self.set_layout(self.layout_no, swapped=not self.layout_swapped)
+        self._save_layout_prefs()
+
+    def swap_panes_by_id(self, src_id, dst_id):
+        order = self.pane_order[self.layout_no]
+        if src_id in order and dst_id in order and src_id != dst_id:
+            i, j = order.index(src_id), order.index(dst_id)
+            order[i], order[j] = order[j], order[i]
+            self.set_layout(self.layout_no)
+            self._save_layout_prefs()
+
+    def reset_current_layout(self):
+        n = self.layout_no
+        self.split_ratios[n] = dict(DEFAULT_SPLIT_RATIOS[n])
+        self.pane_order[n] = list(DEFAULT_PANE_ORDER[n])
+        self.layout_swapped = False
+        self.set_layout(n)
+        self._save_layout_prefs()
+
+    def _apply_splitter_ratio(self, sp, ratio, total):
+        ratio = max(0.15, min(0.85, float(ratio)))
+        sp.setStretchFactor(0, max(1, round(ratio * 1000)))
+        sp.setStretchFactor(1, max(1, round((1.0 - ratio) * 1000)))
+        sp.apply_ratio(ratio, total=total)
+
+    def _on_splitter_moved(self, layout_no, key, sp, invert=False):
+        r = sp.current_ratio()
+        if r is None:
+            return
+        stored = (1.0 - r) if invert else r
+        self.split_ratios[layout_no][key] = max(0.15, min(0.85, stored))
+        sp.setStretchFactor(0, max(1, round(r * 1000)))
+        sp.setStretchFactor(1, max(1, round((1.0 - r) * 1000)))
+        self._save_layout_prefs()
+        self._refresh_layout_buttons()
+
+    def _reset_splitter_ratio(self, layout_no, key, sp, invert=False):
+        dv = DEFAULT_SPLIT_RATIOS[layout_no][key]
+        self.split_ratios[layout_no][key] = dv
+        vis_r = (1.0 - dv) if invert else dv
+        total = sp.width() if sp.orientation() == Qt.Orientation.Horizontal else sp.height()
+        self._apply_splitter_ratio(sp, vis_r, total)
+        self._save_layout_prefs()
+        self._refresh_layout_buttons()
+
+    def _make_splitter(self, orientation, layout_no, key, invert=False):
+        sp = PresenterSplitter(orientation)
+        sp.on_reset = lambda ln=layout_no, k=key, s=sp, inv=invert: self._reset_splitter_ratio(ln, k, s, inv)
+        sp.splitterMoved.connect(lambda _pos, _idx, ln=layout_no, k=key, s=sp, inv=invert:
+                                 self._on_splitter_moved(ln, k, s, inv))
+        return sp
 
     def set_layout(self, n, swapped=None):
-        """1: current | next over notes.  2: current | next, big notes below.  3: current | next, no notes."""
+        """1: main | side_top over side_bottom.  2: top_left | top_right over bottom.  3: left | right, no notes.
+        All pane borders are draggable splitters; pane headers can be dragged onto each other to swap positions."""
         if swapped is not None:
             self.layout_swapped = swapped
+        bw = self.body.width() if self.body.width() > 200 else max(800, self.width())
+        bh = self.body.height() if self.body.height() > 200 else max(500, self.height() - 32)
         old, self.body = self.body, QWidget()   # widgets move into the new container when added
         self.body.setObjectName('paneGrid')
+        order = self.pane_order[n]
+        ratios = self.split_ratios[n]
+        self._active_splitters = {}
+
         if n == 1:
-            slide_col, notes_col = QVBoxLayout(), QVBoxLayout()
-            slide_col.setSpacing(1)
-            notes_col.setSpacing(1)
-            slide_col.addWidget(self.cur_card, 1)
-            slide_col.addWidget(self.status_frame)
-            notes_col.addWidget(self.next_card, 2)
-            notes_col.addWidget(self.notes_card, 5)
-            g = QHBoxLayout(self.body)
-            g.setSpacing(1)
+            p0, p1, p2 = (self._panes[pid] for pid in order)
+            main_col = QWidget()
+            main_col.setObjectName('paneGrid')
+            ml = QVBoxLayout(main_col)
+            ml.setContentsMargins(0, 0, 0, 0)
+            ml.setSpacing(1)
+            ml.addWidget(p0, 1)
+            ml.addWidget(self.status_frame)
+
+            side_split = self._make_splitter(Qt.Orientation.Vertical, 1, 'side', invert=False)
+            side_split.addWidget(p1)
+            side_split.addWidget(p2)
+            self._apply_splitter_ratio(side_split, ratios['side'], bh)
+
+            main_split = self._make_splitter(Qt.Orientation.Horizontal, 1, 'main', invert=self.layout_swapped)
             if self.layout_swapped:
-                g.addLayout(notes_col, 9)
-                g.addLayout(slide_col, 11)
+                main_split.addWidget(side_split)
+                main_split.addWidget(main_col)
+                self._apply_splitter_ratio(main_split, 1.0 - ratios['main'], bw)
             else:
-                g.addLayout(slide_col, 11)
-                g.addLayout(notes_col, 9)
-        else:
-            slides_row = QHBoxLayout()
-            slides_row.setSpacing(1)
-            if n == 3 and self.layout_swapped:
-                slides_row.addWidget(self.next_card)
-                slides_row.addWidget(self.cur_card)
-            else:
-                slides_row.addWidget(self.cur_card)
-                slides_row.addWidget(self.next_card)
+                main_split.addWidget(main_col)
+                main_split.addWidget(side_split)
+                self._apply_splitter_ratio(main_split, ratios['main'], bw)
+
             g = QVBoxLayout(self.body)
-            g.setSpacing(1)
-            if n == 2 and self.layout_swapped:
-                g.addWidget(self.notes_card, 5)
-                g.addLayout(slides_row, 4)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setSpacing(0)
+            g.addWidget(main_split, 1)
+            self._active_splitters = {'main': main_split, 'side': side_split}
+        elif n == 2:
+            p0, p1, p2 = (self._panes[pid] for pid in order)
+            top_split = self._make_splitter(Qt.Orientation.Horizontal, 2, 'top', invert=False)
+            top_split.addWidget(p0)
+            top_split.addWidget(p1)
+            self._apply_splitter_ratio(top_split, ratios['top'], bw)
+
+            main_split = self._make_splitter(Qt.Orientation.Vertical, 2, 'main', invert=self.layout_swapped)
+            if self.layout_swapped:
+                main_split.addWidget(p2)
+                main_split.addWidget(top_split)
+                self._apply_splitter_ratio(main_split, 1.0 - ratios['main'], max(200, bh - 72))
             else:
-                g.addLayout(slides_row, 4 if n == 2 else 1)
-                g.addWidget(self.notes_card, 5)
+                main_split.addWidget(top_split)
+                main_split.addWidget(p2)
+                self._apply_splitter_ratio(main_split, ratios['main'], max(200, bh - 72))
+
+            g = QVBoxLayout(self.body)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setSpacing(1)
+            g.addWidget(main_split, 1)
             g.addWidget(self.status_frame)
-        g.setContentsMargins(0, 0, 0, 0)
+            self._active_splitters = {'main': main_split, 'top': top_split}
+        else:
+            p0, p1 = (self._panes[pid] for pid in order)
+            self.notes_card.setParent(self)
+            self.notes_card.hide()
+            main_split = self._make_splitter(Qt.Orientation.Horizontal, 3, 'main', invert=self.layout_swapped)
+            if self.layout_swapped:
+                main_split.addWidget(p1)
+                main_split.addWidget(p0)
+                self._apply_splitter_ratio(main_split, 1.0 - ratios['main'], bw)
+            else:
+                main_split.addWidget(p0)
+                main_split.addWidget(p1)
+                self._apply_splitter_ratio(main_split, ratios['main'], bw)
+
+            g = QVBoxLayout(self.body)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setSpacing(1)
+            g.addWidget(main_split, 1)
+            g.addWidget(self.status_frame)
+            self._active_splitters = {'main': main_split}
+
         self.notes_card.setVisible(n != 3)
         self.layout().replaceWidget(old, self.body)
         old.deleteLater()
@@ -1722,7 +2416,7 @@ class Presenter(QWidget):
         self.cur.update()
         self.aud.update()
 
-    # --- pointer & pen annotations ---
+    # --- pointer, zoom & pen annotations ---
     @staticmethod
     def _pt_seg_dist2(px, py, ax, ay, bx, by):
         dx, dy = bx - ax, by - ay
@@ -1733,16 +2427,78 @@ class Presenter(QWidget):
         return (px - cx) ** 2 + (py - cy) ** 2
 
     def _slide_coords(self, pos):
-        r = self.cur.target()
-        if r is None or r.width() <= 0 or r.height() <= 0:
-            return None
-        rx, ry = (pos.x() - r.x()) / r.width(), (pos.y() - r.y()) / r.height()
-        return (rx, ry) if 0 <= rx <= 1 and 0 <= ry <= 1 else None
+        return self.cur.widget_to_slide(pos)
 
-    def erase_at(self, pt, radius=0.025):
+    def _cancel_zoom_interaction(self):
+        self._zoom_drag_start = None
+        self._zoom_drag_start_px = None
+        self._panning = False
+        self._pan_last_px = None
+        self._pan_minimap = False
+        self.cur.select_rect = None
+        self.cur.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _update_zoom_ui(self):
+        if self.zoom_rect is not None:
+            factor = self.cur.zoom_factor()
+            self.btn_zoom_reset.setText(f'{factor:.1f}× ✕')
+            self.btn_zoom_reset.show()
+            self.lbl_zoom.setText(f'Zoom {factor:.1f}×')
+            self.lbl_zoom.show()
+        else:
+            self.btn_zoom_reset.hide()
+            self.lbl_zoom.hide()
+
+    def set_zoom(self, rect, fast=False):
+        self.zoom_rect = rect
+        self.cur.zoom_rect = self.aud.zoom_rect = rect
+        if fast:
+            self.cur.schedule_fast_draw()
+            self.aud.schedule_fast_draw()
+        else:
+            for v in (self.cur, self.aud):
+                v._settle_timer.stop()
+                v._fast_draw = False
+                v.update()
+        self._update_zoom_ui()
+
+    def reset_zoom(self):
+        self._cancel_zoom_interaction()
+        self.set_zoom(None, fast=False)
+        if self.mode == 'zoom':
+            self.mode = self._pre_zoom_mode
+        self.set_pointer(self.aud.pointer)
+        self.tick()
+
+    def toggle_zoom_mode(self, force_select=False):
+        self._cancel_zoom_interaction()
+        if self.mode == 'zoom':
+            self.mode = self._pre_zoom_mode
+            self.set_pointer(self.aud.pointer)
+            self.tick()
+            return
+        if self.zoom_rect is not None and not force_select:
+            self.reset_zoom()
+            return
+        self._pre_zoom_mode = self.mode if self.mode in MODES else 'laser'
+        self.mode = 'zoom'
+        self.set_pointer(None)
+        self.tick()
+
+    def _center_zoom_on(self, pt, fast=True):
+        if self.zoom_rect is None:
+            return
+        w, h = self.zoom_rect.width(), self.zoom_rect.height()
+        zx = max(0.0, min(1.0 - w, pt[0] - w * 0.5))
+        zy = max(0.0, min(1.0 - h, pt[1] - h * 0.5))
+        self.set_zoom(QRectF(zx, zy, w, h), fast=fast)
+
+    def erase_at(self, pt, radius=None):
         strokes = self.annotations.get(self.n)
         if not strokes:
             return False
+        if radius is None:
+            radius = 0.025 * self.cur.view_rect().width()
         px, py = pt
         r2 = radius * radius
         hit = []
@@ -1767,7 +2523,39 @@ class Presenter(QWidget):
         return True
 
     def on_press(self, e):
+        if self.cur.full and e.button() == Qt.MouseButton.LeftButton:
+            self.play_pause()
+            return
+        # Minimap interaction while zoomed
+        m_pt = self.cur.minimap_to_slide(e.position())
+        if m_pt is not None:
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._pan_minimap = True
+                self.cur.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._center_zoom_on(m_pt, fast=True)
+                self.set_pointer(None)
+                return
+            if e.button() == Qt.MouseButton.RightButton:
+                self.reset_zoom()
+                return
+
         pt = self._slide_coords(e.position())
+        mods = e.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        if e.button() == Qt.MouseButton.RightButton and self.mode == 'zoom':
+            self.toggle_zoom_mode(force_select=True)
+            return
+        if self.zoom_rect is not None and (
+            e.button() == Qt.MouseButton.MiddleButton or
+            (e.button() == Qt.MouseButton.LeftButton and shift) or
+            (e.button() == Qt.MouseButton.RightButton and self.mode not in ('pen', 'eraser', 'zoom'))
+        ):
+            self._panning = True
+            self._pan_last_px = e.position()
+            self.cur.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if e.button() == Qt.MouseButton.RightButton and self.mode in ('pen', 'eraser'):
             if pt is not None:
                 self.erasing = True
@@ -1775,10 +2563,13 @@ class Presenter(QWidget):
             return
         if e.button() != Qt.MouseButton.LeftButton:
             return
-        if self.cur.full:
-            self.play_pause()
-            return
         if pt is None:
+            return
+        if self.mode == 'zoom' or ctrl:
+            self._zoom_drag_start = pt
+            self._zoom_drag_start_px = e.position()
+            self.cur.select_rect = (pt, pt)
+            self.cur.update()
             return
         if self.mode == 'eraser':
             self.erasing = True
@@ -1799,6 +2590,33 @@ class Presenter(QWidget):
                 return
 
     def on_release(self, e):
+        if self._pan_minimap and e.button() == Qt.MouseButton.LeftButton:
+            self._pan_minimap = False
+            self.cur.setCursor(Qt.CursorShape.OpenHandCursor if self.cur.minimap_to_slide(e.position())
+                               else Qt.CursorShape.CrossCursor)
+            self.set_zoom(self.zoom_rect, fast=False)
+            return
+        if self._panning:
+            self._panning = False
+            self._pan_last_px = None
+            self.cur.setCursor(Qt.CursorShape.CrossCursor)
+            self.set_zoom(self.zoom_rect, fast=False)
+            return
+        if self._zoom_drag_start is not None and e.button() == Qt.MouseButton.LeftButton:
+            p0, p0_px = self._zoom_drag_start, self._zoom_drag_start_px
+            self._zoom_drag_start = self._zoom_drag_start_px = None
+            self.cur.select_rect = None
+            p1 = self.cur.widget_to_slide(e.position(), clamp=True) or p0
+            if (e.position() - p0_px).manhattanLength() < 10:
+                new_rect = zoom_around(self.zoom_rect, p1, 2.0)
+            else:
+                new_rect = compute_zoom_rect(p0, p1)
+            self.set_zoom(new_rect, fast=False)
+            if self.mode == 'zoom':
+                self.mode = self._pre_zoom_mode
+            self.set_pointer(self._slide_coords(e.position()))
+            self.tick()
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             self.drawing_stroke = None
             self.erasing = False
@@ -1806,6 +2624,34 @@ class Presenter(QWidget):
             self.erasing = False
 
     def on_move(self, e):
+        if self._pan_minimap:
+            m_pt = self.cur.minimap_to_slide(e.position(), clamp=True)
+            if m_pt is not None:
+                self._center_zoom_on(m_pt, fast=True)
+            self.set_pointer(None)
+            return
+        if self._panning and self._pan_last_px is not None:
+            r = self.cur.target()
+            if r is not None and r.width() > 0 and r.height() > 0 and self.zoom_rect is not None:
+                dx_px = e.position().x() - self._pan_last_px.x()
+                dy_px = e.position().y() - self._pan_last_px.y()
+                self._pan_last_px = e.position()
+                vr = self.cur.view_rect()
+                dsx = -(dx_px / r.width()) * vr.width()
+                dsy = -(dy_px / r.height()) * vr.height()
+                self.set_zoom(pan_zoom_rect(self.zoom_rect, dsx, dsy), fast=True)
+            return
+        if self._zoom_drag_start is not None:
+            pt_clamped = self.cur.widget_to_slide(e.position(), clamp=True)
+            if pt_clamped is not None:
+                self.cur.select_rect = (self._zoom_drag_start, pt_clamped)
+                self.cur.update()
+            return
+        if self.cur.minimap_to_slide(e.position()) is not None:
+            self.cur.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.set_pointer(None)
+            return
+        self.cur.setCursor(Qt.CursorShape.CrossCursor)
         pt = self._slide_coords(e.position())
         if self.erasing and pt is not None:
             self.erase_at(pt)
@@ -1824,7 +2670,9 @@ class Presenter(QWidget):
         self.aud.update()
 
     def _refresh_tool_buttons(self):
-        for btn, active in ((self.btn_pen, self.mode == 'pen'), (self.btn_eraser, self.mode == 'eraser')):
+        for btn, active in ((self.btn_pen, self.mode == 'pen'),
+                            (self.btn_eraser, self.mode == 'eraser'),
+                            (self.btn_zoom, self.mode == 'zoom')):
             name = 'toolBtnActive' if active else 'toolBtn'
             if btn.objectName() != name:
                 btn.setObjectName(name)
@@ -1840,11 +2688,13 @@ class Presenter(QWidget):
         self.tick()
 
     def toggle_pen(self):
+        self._cancel_zoom_interaction()
         self.mode = 'laser' if self.mode == 'pen' else 'pen'
         self.set_pointer(self.aud.pointer)
         self.tick()
 
     def toggle_eraser(self):
+        self._cancel_zoom_interaction()
         self.mode = 'pen' if self.mode == 'eraser' else 'eraser'
         self.set_pointer(self.aud.pointer)
         self.tick()
@@ -1917,6 +2767,8 @@ class Presenter(QWidget):
             dot_color, mode_txt = '#d4912a', 'Pointer'
         elif self.mode == 'eraser':
             dot_color, mode_txt = '#b4b4bc', 'Eraser'
+        elif self.mode == 'zoom':
+            dot_color, mode_txt = '#58a6ff', 'Zoom'
         else:
             dot_color, mode_txt = '#4e4e56', 'Off'
         dot = '○' if self.mode == 'off' else '●'
@@ -2000,6 +2852,8 @@ class Presenter(QWidget):
             self.adjust_note_font(2)
         elif ctrl and k == K.Key_Minus:
             self.adjust_note_font(-2)
+        elif ctrl and k == K.Key_0:
+            self.reset_zoom()
         elif ctrl and k == K.Key_G:
             self.prompt_jump()
         elif ctrl and k == K.Key_Z:
@@ -2021,9 +2875,13 @@ class Presenter(QWidget):
         elif k in (K.Key_Question, K.Key_H):
             self.toggle_help()
         elif k == K.Key_L:
-            self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
+            self._cancel_zoom_interaction()
+            idx = (MODES.index(self.mode) + 1) % len(MODES) if self.mode in MODES else 0
+            self.mode = MODES[idx]
             self.set_pointer(self.aud.pointer)
             self.tick()
+        elif k == K.Key_M:
+            self.toggle_zoom_mode(force_select=shift)
         elif k == K.Key_D:
             self.toggle_pen()
         elif k == K.Key_E:
@@ -2081,8 +2939,13 @@ class Presenter(QWidget):
             self.set_layout(k - K.Key_0)
         elif k == K.Key_F:
             win.showNormal() if win.isFullScreen() else win.showFullScreen()
-        elif k == K.Key_Escape and win.isFullScreen():
-            win.showNormal()
+        elif k == K.Key_Escape:
+            if self.mode == 'zoom':
+                self.toggle_zoom_mode(force_select=True)
+            elif self.zoom_rect is not None:
+                self.reset_zoom()
+            elif win.isFullScreen():
+                win.showNormal()
         elif k == K.Key_Q:
             QApplication.quit()
 
@@ -2333,7 +3196,7 @@ class NotesEditor(QWidget):
         preview_card = make_pane('Preview', self.preview)
         self.edit_card = make_pane(os.path.basename(self.path), self.edit, [self.save_btn])
 
-        left_split = QSplitter(Qt.Orientation.Vertical)
+        left_split = PresenterSplitter(Qt.Orientation.Vertical)
         left_split.addWidget(self.slide_card)
         left_split.addWidget(preview_card)
         left_split.setSizes([520, 360])
@@ -2345,7 +3208,7 @@ class NotesEditor(QWidget):
         rv.addWidget(self.edit_card, 1)
         rv.addWidget(self.mini)
 
-        self.split = QSplitter()
+        self.split = PresenterSplitter(Qt.Orientation.Horizontal)
         self.split.addWidget(left_split)
         self.split.addWidget(right)
         self.split.setSizes([660, 840])
@@ -2563,6 +3426,7 @@ def main():
                     help='presenter layout: 1 current|next+notes, 2 big notes below, 3 no notes')
     ap.add_argument('-n', '--notes', help='Markdown speaker notes (default: <pdf name>.notes.md if present)')
     ap.add_argument('-e', '--edit', action='store_true', help='open the Markdown notes editor instead')
+    ap.add_argument('--reset-layout', action='store_true', help='reset saved presenter pane sizes and order')
     ap.add_argument('--install-desktop', action='store_true', help='add a launcher to the desktop app menu')
     ap.add_argument('--uninstall-desktop', action='store_true', help='remove that launcher')
     a = ap.parse_args()
@@ -2576,7 +3440,7 @@ def main():
     path = a.pdf or QFileDialog.getOpenFileName(None, 'Open PDF', '', 'PDF (*.pdf)')[0]
     if not path:
         sys.exit(0)
-    w = NotesEditor(path, a.notes) if a.edit else Presenter(path, a.duration, a.layout, a.notes)  # noqa: F841
+    w = NotesEditor(path, a.notes) if a.edit else Presenter(path, a.duration, a.layout, a.notes, reset_layout=a.reset_layout)  # noqa: F841
     sys.exit(app.exec())
 
 
